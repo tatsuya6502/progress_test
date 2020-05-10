@@ -1,146 +1,96 @@
-use futures::future::FutureExt;
-use std::fmt;
-use std::io::SeekFrom;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Poll, Context};
-use tokio::io::{AsyncSeek, Result, ErrorKind};
+use std::{
+    fmt,
+    io::SeekFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncSeek, Result};
 use tokio::prelude::*;
-use tokio::sync::Mutex;
 
-use crate::item::Item;
-
-struct ProgressInner<T> {
-    size: u64,
-    buf: T,
+pub struct Progress {
+    size: AtomicU64,
 }
 
-impl<T> fmt::Debug for ProgressInner<T> {
+impl fmt::Debug for Progress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProgressInner")
+        f.debug_struct("Progress")
             .field("size", &self.size)
             .finish()
     }
 }
 
-pub struct Progress<T> {
-    inner: Arc<Mutex<ProgressInner<T>>>,
-}
-
-impl<T> std::clone::Clone for Progress<T> {
-    fn clone(&self) -> Self {
-        Progress { inner: self.inner.clone() }
+impl Progress {
+    pub fn to_size(&self) -> u64 {
+        self.size.load(Ordering::Acquire)
     }
 }
 
-impl<T> Progress<T> {
+pub struct ProgressDecorator<T> {
+    buf: T,
+    progress: Arc<Progress>,
+}
+
+impl<T> ProgressDecorator<T> {
     pub fn new(buf: T) -> Self {
-        let inner = Arc::new(Mutex::new(ProgressInner {
-            size: 0,
+        Self {
+            progress: Arc::new(Progress {
+                size: AtomicU64::default(),
+            }),
             buf,
-        }));
-        Progress { inner }
+        }
     }
 
-    pub async fn to_size(&self) -> u64 {
-        let pg = self.inner.lock().await;
-        pg.size
+    pub fn progress(&self) -> Arc<Progress> {
+        Arc::clone(&self.progress)
     }
 }
 
-impl<T: AsyncRead + Unpin + Send> AsyncRead for Progress<T> {
+impl<T: AsyncRead + Unpin + Send> AsyncRead for ProgressDecorator<T> {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut [u8]
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                Pin::new(&mut s.buf).poll_read(cx, buf)
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
-        }
+        Pin::new(&mut self.buf).poll_read(cx, buf)
     }
 }
 
-impl<T: AsyncWrite + Unpin + Send> AsyncWrite for Progress<T> {
+impl<T: AsyncWrite + Unpin + Send> AsyncWrite for ProgressDecorator<T> {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8]
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<Result<usize>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                let poll = Pin::new(&mut s.buf).poll_write(cx, buf);
-                if let Poll::Ready(Ok(n)) = poll {
-                    s.size += n as u64;
-                }
-                poll
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
+        let poll = Pin::new(&mut self.buf).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.progress.size.fetch_add(n as u64, Ordering::Acquire);
         }
+        poll
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context
-    ) -> Poll<Result<()>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                Pin::new(&mut s.buf).poll_flush(cx)
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
-        }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.buf).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context
-    ) -> Poll<Result<()>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                Pin::new(&mut s.buf).poll_shutdown(cx)
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
-        }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.buf).poll_shutdown(cx)
     }
 }
 
-impl<T: AsyncSeek + Unpin + Send> AsyncSeek for Progress<T> {
+impl<T: AsyncSeek + Unpin + Send> AsyncSeek for ProgressDecorator<T> {
     fn start_seek(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        position: SeekFrom
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        position: SeekFrom,
     ) -> Poll<Result<()>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                Pin::new(&mut s.buf).start_seek(cx, position)
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
-        }
+        Pin::new(&mut self.buf).start_seek(cx, position)
     }
 
-    fn poll_complete(
-        self: Pin<&mut Self>,
-        cx: &mut Context
-    ) -> Poll<Result<u64>> {
-        match self.inner.lock().boxed().as_mut().poll(cx) {
-            Poll::Ready(mut s) => {
-                Pin::new(&mut s.buf).poll_complete(cx)
-            },
-            Poll::Pending => {
-                Poll::Pending
-            }
-        }
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
+        Pin::new(&mut self.buf).poll_complete(cx)
     }
 }
