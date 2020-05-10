@@ -1,8 +1,10 @@
+#![warn(rust_2018_idioms)]
+#![warn(clippy::all)]
+
 mod progress;
 
-use tokio::io::{self, BufReader, BufWriter};
-
 use progress::Progress;
+use tokio::io::{self, BufReader, BufWriter};
 
 #[tokio::main]
 async fn main() {
@@ -18,7 +20,8 @@ async fn main() {
     tokio::task::spawn(async move {
         loop {
             tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
-            println!("{:?}", pg.to_size().await);
+            let size = pg.to_size();
+            println!("{:?}", size.await);
         }
     });
 
