@@ -26,8 +26,12 @@ impl<T> fmt::Debug for ProgressInner<T> {
     }
 }
 
+// Mutexが返してくるFutureの型
 type MutexFuture<'a, T> = Box<dyn Future<Output = MutexGuard<'a, T>> + Send + Sync>;
 
+// LockStateはロックの状態を表す。Mutexが返すFutureとそのFutureが返すMutexGuardの
+// ライフタイムはうまく表現できないので'staticにする。LockStateのライフタイムの管理は
+// 手動で（慎重に）行う
 enum LockState<T: 'static> {
     Released,
     Acquiring(Pin<MutexFuture<'static, T>>),
@@ -36,6 +40,12 @@ enum LockState<T: 'static> {
 
 pub struct Progress<T: 'static> {
     inner: Pin<Arc<Mutex<ProgressInner<T>>>>,
+    // ・lock_stateはAsyncRead、AsyncWrite、AsyncSeek関連のメソッド用なので
+    // 　to_size()など他のメソッドでは使用しない
+    // ・lock_stateに格納されたFutureやMutexGuardはinnerのMutexを参照しているため
+    // 　Progressのdrop時はinnerより前にdropする必要がある
+    // ・ManDrop（std::mem::ManuallyDropのエイリアス）で包むことで、dropの
+    // 　タイミングを手動でコントロールする
     lock_state: ManDrop<LockState<ProgressInner<T>>>,
 }
 
@@ -50,7 +60,9 @@ impl<T> Clone for Progress<T> {
 
 impl<T> Drop for Progress<T> {
     fn drop(&mut self) {
+        // 最初にlock_stateをdropする
         unsafe { ManDrop::drop(&mut self.lock_state) };
+        // それ以外のフィールドはこのメソッドから返った後に自動的にdropされる
     }
 }
 
@@ -68,6 +80,9 @@ impl<T: Unpin + Send> Progress<T> {
         pg.size
     }
 
+    // ・lock_and_then()はAsyncRead、AsyncWrite、AsyncSeek関連のメソッドで共通に行われる処理を
+    // 　抽象化したもの。ロックを取得後、引数にとったクロージャで非同期IO処理を実行し、最後にロックを解除する
+    // ・ロック取得時や非同期IO時にPoll::Pendingが返されたときは早期リターンする
     fn lock_and_then<U, F>(&mut self, cx: &mut Context<'_>, f: F) -> Poll<Result<U>>
     where
         F: FnOnce(Pin<&mut T>, &mut Context<'_>, &mut u64) -> Poll<Result<U>>,
@@ -76,6 +91,8 @@ impl<T: Unpin + Send> Progress<T> {
         loop {
             match &mut *self.lock_state {
                 Released => {
+                    // Mutexのlock()が返すFutureとそのMutexGuardのライフタイムを'staticにするため
+                    // Mutexの可変参照を可変の生ポインタに変換してからlock()を呼ぶ
                     let mutex = &self.inner as &Mutex<_> as *const Mutex<_>;
                     let fut = unsafe { Box::pin((*mutex).lock()) };
                     self.set_lock_state(Acquiring(fut));
@@ -99,6 +116,7 @@ impl<T: Unpin + Send> Progress<T> {
 
     fn set_lock_state(&mut self, new: LockState<ProgressInner<T>>) {
         let mut old = std::mem::replace(&mut self.lock_state, ManDrop::new(new));
+        // lock_stateはManuallyDropなので、以前の値を手動でdropする
         unsafe { ManDrop::drop(&mut old) }
     }
 }
