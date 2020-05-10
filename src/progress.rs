@@ -11,6 +11,7 @@ use std::{
 use tokio::io::{AsyncSeek, Result};
 use tokio::prelude::*;
 
+// 非同期IOの進捗を表す型。複数の非同期タスクから共有されるのでAtomic系の型を使う
 pub struct Progress {
     size: AtomicU64,
 }
@@ -25,10 +26,14 @@ impl fmt::Debug for Progress {
 
 impl Progress {
     pub fn to_size(&self) -> u64 {
+        // Acquire (Release-Acquire) は今回の用途には十分
+        // これに対応するマシン命令はx86系など多くのプロセッサに標準装備されており
+        // 効率よく実行できる
         self.size.load(Ordering::Acquire)
     }
 }
 
+// AsyncWriteなどを提供する型。一つの非同期タスクのみから使われることを前提にしている
 pub struct ProgressDecorator<T> {
     buf: T,
     progress: Arc<Progress>,
